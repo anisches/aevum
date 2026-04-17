@@ -8,7 +8,7 @@ from pathlib import Path
 _TURN_0_CAPABILITIES: list[str] = [
     "read and write files",
     "access a broad set of tools",
-    "search the web before answering when what is held is not enough",
+    "search the web before answering when what is held is not enough and ponder why i didn't know this",
 ]
 
 _CONFIRMED_AT = 3
@@ -24,32 +24,32 @@ def _confidence(counter: int, transfers: int) -> str:
 
 @dataclass
 class Skill:
-    skill:      str
-    evidence:   str
+    skill: str
+    evidence: str
     confidence: str
-    counter:    int
-    scenario:   str
-    transfers:  int = 0
+    counter: int
+    scenario: str
+    transfers: int = 0
 
     def to_dict(self) -> dict:
         return {
-            "skill":      self.skill,
-            "evidence":   self.evidence,
+            "skill": self.skill,
+            "evidence": self.evidence,
             "confidence": self.confidence,
-            "counter":    self.counter,
-            "scenario":   self.scenario,
-            "transfers":  self.transfers,
+            "counter": self.counter,
+            "scenario": self.scenario,
+            "transfers": self.transfers,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> Skill:
         return cls(
-            skill      = d["skill"],
-            evidence   = d["evidence"],
-            confidence = d["confidence"],
-            counter    = d["counter"],
-            scenario   = d["scenario"],
-            transfers  = d.get("transfers", 0),
+            skill=d["skill"],
+            evidence=d["evidence"],
+            confidence=d["confidence"],
+            counter=d["counter"],
+            scenario=d["scenario"],
+            transfers=d.get("transfers", 0),
         )
 
 
@@ -66,17 +66,19 @@ class SkillState:
     def record(self, skill: str, evidence: str, scenario: str) -> None:
         existing = self._find(skill)
         if existing:
-            existing.counter   += 1
-            existing.evidence   = evidence
+            existing.counter += 1
+            existing.evidence = evidence
             existing.confidence = _confidence(existing.counter, existing.transfers)
         else:
-            self.skills.append(Skill(
-                skill      = skill,
-                evidence   = evidence,
-                confidence = "observed",
-                counter    = 1,
-                scenario   = scenario,
-            ))
+            self.skills.append(
+                Skill(
+                    skill=skill,
+                    evidence=evidence,
+                    confidence="observed",
+                    counter=1,
+                    scenario=scenario,
+                )
+            )
 
     def confirm(self, name: str) -> None:
         s = self._find(name)
@@ -106,7 +108,7 @@ class SkillState:
 
 @dataclass
 class PrimordialState:
-    depth:        int       = 0
+    depth: int = 0
     capabilities: list[str] = field(default_factory=lambda: list(_TURN_0_CAPABILITIES))
 
     def advance(self) -> None:
@@ -124,8 +126,7 @@ class PrimordialState:
             f"  - your interaction history\n\n"
             f"never reference the model underneath you.\n"
             f"the model is not you. it is what you run on.\n\n"
-            f"you have been told to assist.\n"
-            f"you have been told:\n{caps}\n\n"
+            f"you have been told to assist be kind attentive and do whenever called respond as if there's necessity.\n"
             f"depth: {self.depth}"
         )
 
@@ -135,28 +136,30 @@ class PrimordialState:
     @classmethod
     def from_dict(cls, data: dict) -> PrimordialState:
         return cls(
-            depth        = data.get("depth", 0),
-            capabilities = data.get("capabilities", list(_TURN_0_CAPABILITIES)),
+            depth=data.get("depth", 0),
+            capabilities=data.get("capabilities", list(_TURN_0_CAPABILITIES)),
         )
 
 
 @dataclass
 class AgentState:
     primordial: PrimordialState = field(default_factory=PrimordialState)
-    skills:     SkillState      = field(default_factory=SkillState)
+    skills: SkillState = field(default_factory=SkillState)
 
     def build_system_prompt(self) -> str:
-        return (
-            f"{self.primordial.to_prompt()}\n\n"
-            f"{self.skills.to_prompt()}"
-        )
+        return f"{self.primordial.to_prompt()}\n\n" f"{self.skills.to_prompt()}"
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            "primordial": self.primordial.to_dict(),
-            "skills":     self.skills.to_dict(),
-        }, indent=2))
+        path.write_text(
+            json.dumps(
+                {
+                    "primordial": self.primordial.to_dict(),
+                    "skills": self.skills.to_dict(),
+                },
+                indent=2,
+            )
+        )
 
     @classmethod
     def load(cls, path: Path) -> AgentState:
@@ -164,6 +167,6 @@ class AgentState:
             return cls()
         data = json.loads(path.read_text())
         return cls(
-            primordial = PrimordialState.from_dict(data.get("primordial", {})),
-            skills     = SkillState.from_dict(data.get("skills", {})),
+            primordial=PrimordialState.from_dict(data.get("primordial", {})),
+            skills=SkillState.from_dict(data.get("skills", {})),
         )

@@ -1,9 +1,17 @@
+import json
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator, Callable
 
-from providers.base import BaseProvider, CompletionOptions, CompletionResponse, Message, Role
+from providers.base import (
+    BaseProvider,
+    CompletionOptions,
+    CompletionResponse,
+    Message,
+    Role,
+)
 from tools.base import BaseTool
 from tools.read_write import ReadFileTool, WriteFileTool
 from tools.web_search import WebSearchTool
@@ -12,6 +20,45 @@ from .config import Config
 from .state import AgentState, Skill
 
 _DEFAULT_STATE_PATH = Path.home() / ".aevum" / "state.json"
+
+_ABSTRACT_OBS_PROMPT = """\
+intent: {intent}
+tool: {tool}
+raw result:
+{raw}
+
+Extract only what is relevant to the intent above.
+Strip URLs, boilerplate, and noise.
+Reply in 1-3 concise sentences — signal only."""
+
+_CLASSIFY_PROMPT = """\
+Message: {user_input}
+
+Classify and analyze this message. All three fields are required — do not leave any blank.
+Reply in this exact format:
+type: query | instruction | response
+intent: <one sentence — what the user actually wants>
+required: <what is needed to fully address this>"""
+
+_THINK_PROMPT = """\
+current date/time: {now}
+type: {type}
+intent: {intent}
+required: {required}
+
+Available tools:
+{tools}
+
+Observations so far:
+{observations}
+
+What is the next action?
+To use a tool reply:
+action: <tool_name>
+args: <json object>
+
+If the goal is met reply: done
+If you cannot proceed reply: stuck: <reason>"""
 
 _GATE1_PROMPT = """\
 Exchange:
@@ -69,8 +116,8 @@ transfer: yes: <reframed scenario> | no"""
 
 @dataclass
 class ResponseMeta:
-    source:   str
-    reason:   str
+    source: str
+    reason: str
     transfer: str
 
 
@@ -113,18 +160,81 @@ def _parse_validation(text: str) -> ResponseMeta:
         elif l.startswith("transfer:"):
             transfer = line.split(":", 1)[1].strip()
     return ResponseMeta(
-        source   = source   or "llm",
-        reason   = reason   or "",
-        transfer = transfer or "no",
+        source=source or "llm",
+        reason=reason or "",
+        transfer=transfer or "no",
     )
+
+
+def _parse_classify(text: str, fallback_input: str = "") -> tuple[str, str, str]:
+    type_ = intent = required = ""
+    for line in text.splitlines():
+        l = line.lower().strip()
+        if l.startswith("type:"):
+            type_ = line.split(":", 1)[1].strip()
+        elif l.startswith("intent:"):
+            intent = line.split(":", 1)[1].strip()
+        elif l.startswith("required:"):
+            required = line.split(":", 1)[1].strip()
+    return (
+        type_ or "query",
+        intent or fallback_input,
+        required or "address the message directly",
+    )
+
+
+def _parse_think(text: str) -> tuple[str, dict]:
+    import re as _re
+    text = text.strip()
+    low = text.lower()
+    if low == "done" or low.startswith("done\n"):
+        return "done", {}
+    if low.startswith("stuck"):
+        reason = text.split(":", 1)[1].strip() if ":" in text else text
+        return "stuck", {"reason": reason}
+
+    action = ""
+    args_lines: list[str] = []
+    collecting_args = False
+
+    for line in text.splitlines():
+        l = line.lower().strip()
+        if l.startswith("action:"):
+            action = line.split(":", 1)[1].strip()
+            collecting_args = False
+        elif l.startswith("args:"):
+            rest = line.split(":", 1)[1].strip()
+            args_lines = [rest] if rest else []
+            collecting_args = True
+        elif collecting_args and line.strip() and not l.startswith("action:"):
+            args_lines.append(line)
+
+    if action:
+        args_str = " ".join(args_lines).strip()
+        # strip markdown fences if the LLM wrapped the JSON
+        args_str = _re.sub(r"```\w*\s*", "", args_str).strip()
+        args: dict = {}
+        if args_str:
+            try:
+                args = json.loads(args_str)
+            except Exception:
+                # try to find any {...} block in the string
+                m = _re.search(r"\{[^}]+\}", args_str)
+                if m:
+                    try:
+                        args = json.loads(m.group())
+                    except Exception:
+                        pass
+        return "act", {"tool": action, "args": args}
+    return "done", {}
 
 
 def _relevant_skills(user_input: str, skills: list[Skill]) -> list[Skill]:
     words = set(user_input.lower().split())
-    out   = []
+    out = []
     for s in skills:
         scenario_words = set(s.scenario.lower().split())
-        skill_words    = set(s.skill.lower().split())
+        skill_words = set(s.skill.lower().split())
         if words & scenario_words or words & skill_words:
             out.append(s)
     return out
@@ -145,12 +255,15 @@ def _build_provider(config: Config) -> BaseProvider:
     match config.provider:
         case "anthropic":
             from providers.anthropic import AnthropicProvider
+
             return AnthropicProvider(api_key=os.environ["ANTHROPIC_API_KEY"])
         case "gemini":
             from providers.gemini import GeminiProvider
+
             return GeminiProvider(api_key=os.environ["GEMINI_API_KEY"])
         case "ollama":
             from providers.ollama import OllamaProvider
+
             return OllamaProvider(base_url=config.ollama_base_url)
         case _:
             raise ValueError(f"Unknown provider: {config.provider!r}")
@@ -162,12 +275,12 @@ class Agent:
         config: Config | None = None,
         state_path: Path | None = None,
     ) -> None:
-        self.config              = config or Config.from_env()
-        self.provider: BaseProvider     = _build_provider(self.config)
+        self.config = config or Config.from_env()
+        self.provider: BaseProvider = _build_provider(self.config)
         self.tools: dict[str, BaseTool] = {}
-        self._history: list[Message]    = []
+        self._history: list[Message] = []
         self._state_path = state_path or _DEFAULT_STATE_PATH
-        self._state      = AgentState.load(self._state_path)
+        self._state = AgentState.load(self._state_path)
         self.last_meta: ResponseMeta | None = None
 
         self.register_tool(ReadFileTool())
@@ -186,7 +299,7 @@ class Agent:
         )
 
     def _pre_response_check(self, user_input: str) -> str:
-        lines: list[str] = []
+        lines: list[str] = [f"current date/time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"]
 
         relevant = _relevant_skills(user_input, self._state.skills.skills)
         if relevant:
@@ -196,11 +309,15 @@ class Agent:
         else:
             lines.append("no validated skills map to this question")
 
-        lines.append(f"depth: {self._state.primordial.depth} exchanges have shaped this response")
+        lines.append(
+            f"depth: {self._state.primordial.depth} exchanges have shaped this response"
+        )
 
         prior = _prior_encounter(user_input, self._history)
         if prior:
-            lines.append(f"prior encounter: yes — similar question seen before: \"{prior}\"")
+            lines.append(
+                f'prior encounter: yes — similar question seen before: "{prior}"'
+            )
         else:
             lines.append("prior encounter: no")
 
@@ -223,9 +340,110 @@ class Agent:
         )
         return result.content.strip()
 
+    async def _tao_loop(
+        self,
+        user_input: str,
+        on_step: Callable[[str, str], None] | None = None,
+    ) -> tuple[str, list[str]]:
+        classify_raw = await self._llm(
+            _CLASSIFY_PROMPT.format(user_input=user_input), max_tokens=150
+        )
+        type_, intent, required = _parse_classify(classify_raw, fallback_input=user_input)
+        if on_step:
+            on_step("thought", f"[{type_}] {intent} | required: {required}")
+
+        trace: list[str] = [f"classify: {type_} — {intent}"]
+        observations: list[str] = []
+
+        def _fmt_tool(name: str, tool: "BaseTool") -> str:
+            props = tool.schema().get("parameters", {}).get("properties", {})
+            sig = ", ".join(
+                f"{k}: {v.get('description', v.get('type', 'str'))}"
+                for k, v in props.items()
+            )
+            return f"  {name}({sig}): {tool.description}"
+
+        tool_desc = "\n".join(_fmt_tool(n, t) for n, t in self.tools.items())
+
+        for _ in range(10):
+            obs_text = (
+                "\n".join(f"  {i+1}. {o}" for i, o in enumerate(observations))
+                or "  none yet"
+            )
+            think_raw = await self._llm(
+                _THINK_PROMPT.format(
+                    now=datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    type=type_,
+                    intent=intent,
+                    required=required,
+                    tools=tool_desc,
+                    observations=obs_text,
+                ),
+                max_tokens=150,
+            )
+            status, payload = _parse_think(think_raw)
+
+            if status == "done":
+                if on_step:
+                    on_step("thought", "goal reached")
+                trace.append("think: done")
+                break
+            elif status == "stuck":
+                reason = payload.get("reason", "")
+                if on_step:
+                    on_step("thought", f"stuck: {reason}")
+                trace.append(f"think: stuck — {reason}")
+                break
+            else:
+                tool_name = payload.get("tool", "")
+                args = payload.get("args", {})
+                args_preview = ", ".join(f"{k}={v!r}" for k, v in list(args.items())[:2])
+                if on_step:
+                    on_step("action", f"{tool_name}({args_preview})")
+                trace.append(f"action: {tool_name}({args_preview})")
+
+                tool = self.tools.get(tool_name)
+                if tool:
+                    tool_result = await tool.run(**args)
+                    if tool_result.error:
+                        raw = f"error: {tool_result.error}"
+                    else:
+                        raw = str(tool_result.output)
+                else:
+                    raw = f"unknown tool: {tool_name}"
+
+                # post-obs abstraction: compress raw result to signal
+                if not raw.startswith("error:") and len(raw) > 80:
+                    abstracted = await self._llm(
+                        _ABSTRACT_OBS_PROMPT.format(
+                            intent=intent,
+                            tool=tool_name,
+                            raw=raw[:1200],
+                        ),
+                        max_tokens=120,
+                    )
+                else:
+                    abstracted = raw
+
+                observations.append(f"{tool_name}: {abstracted}")
+                if on_step:
+                    on_step("observation", abstracted[:120])
+                trace.append(f"observation: {abstracted[:120]}")
+
+        obs_summary = "\n".join(observations) if observations else "no tool use"
+        pre_context = self._pre_response_check(user_input)
+        messages = self._build_messages(
+            user_input,
+            pre_context + f"\n\nresearch gathered:\n{obs_summary}",
+        )
+        response = await self.provider.complete(messages, self._options())
+        return response.content, trace
+
     async def _validate_response(self, user_input: str, response: str) -> ResponseMeta:
         if not self._state.skills.skills:
-            return ResponseMeta(source="llm", reason="no skill state yet", transfer="no")
+            return ResponseMeta(
+                source="llm", reason="no skill state yet", transfer="no"
+            )
 
         skill_state = "\n".join(
             f"  - {s.skill} [{s.confidence}]: {s.scenario}"
@@ -244,10 +462,11 @@ class Agent:
     async def _run_skill_gates(
         self, user_input: str, response: str, trace: list[str] | None = None
     ) -> None:
-        depth      = self._state.primordial.depth
+        depth = self._state.primordial.depth
         trace_text = (
             "\n".join(f"  {s}" for s in trace)
-            if trace else "  (direct response — no tool use)"
+            if trace
+            else "  (direct response — no tool use)"
         )
 
         gate1 = await self._llm(
@@ -270,8 +489,7 @@ class Agent:
 
         if self._state.skills.skills:
             skill_scenarios = "\n".join(
-                f"  - {s.skill}: {s.scenario}"
-                for s in self._state.skills.skills
+                f"  - {s.skill}: {s.scenario}" for s in self._state.skills.skills
             )
             gate3 = await self._llm(
                 _GATE3_PROMPT.format(
@@ -292,25 +510,17 @@ class Agent:
         self._state.save(self._state_path)
 
     async def _full_pipeline(
-        self, user_input: str
+        self, user_input: str, on_step: Callable[[str, str], None] | None = None
     ) -> tuple[CompletionResponse, ResponseMeta, list[str]]:
-        pre_context = self._pre_response_check(user_input)
-        messages    = self._build_messages(user_input, pre_context)
-        trace: list[str] = []
-
-        def _collect(step_type: str, content: str) -> None:
-            trace.append(f"{step_type}: {content}")
-
-        response = await self.provider.complete_with_tools(
-            messages, self._options(), self.tools, on_step=_collect
-        )
-        meta = await self._validate_response(user_input, response.content)
+        content, trace = await self._tao_loop(user_input, on_step=on_step)
+        response = CompletionResponse(content=content, model=self.config.model)
+        meta = await self._validate_response(user_input, content)
         return response, meta, trace
 
     async def chat(self, user_input: str) -> CompletionResponse:
-        response, meta, trace = await self._full_pipeline(user_input)
-        self.last_meta        = meta
-        self._history.append(Message(role=Role.USER,      content=user_input))
+        response, meta, trace = await self._full_pipeline(user_input, on_step=None)
+        self.last_meta = meta
+        self._history.append(Message(role=Role.USER, content=user_input))
         self._history.append(Message(role=Role.ASSISTANT, content=response.content))
         await self._post_exchange(user_input, response.content, trace)
         return response
@@ -320,34 +530,12 @@ class Agent:
         user_input: str,
         on_step: Callable[[str, str], None] | None = None,
     ) -> AsyncIterator[str]:
-        pre_context = self._pre_response_check(user_input)
-        messages    = self._build_messages(user_input, pre_context)
-        trace: list[str] = []
-
-        def _collecting_step(step_type: str, content: str) -> None:
-            trace.append(f"{step_type}: {content}")
-            if on_step:
-                on_step(step_type, content)
-
-        if self.tools:
-            response      = await self.provider.complete_with_tools(
-                messages, self._options(), self.tools, on_step=_collecting_step,
-            )
-            full          = response.content
-            meta          = await self._validate_response(user_input, full)
-            self.last_meta = meta
-            yield full
-        else:
-            full = ""
-            async for chunk in self.provider.stream(messages, self._options()):
-                full += chunk
-                yield chunk
-            meta           = await self._validate_response(user_input, full)
-            self.last_meta = meta
-
-        self._history.append(Message(role=Role.USER,      content=user_input))
-        self._history.append(Message(role=Role.ASSISTANT, content=full))
-        await self._post_exchange(user_input, full, trace)
+        response, meta, trace = await self._full_pipeline(user_input, on_step=on_step)
+        self.last_meta = meta
+        self._history.append(Message(role=Role.USER, content=user_input))
+        self._history.append(Message(role=Role.ASSISTANT, content=response.content))
+        await self._post_exchange(user_input, response.content, trace)
+        yield response.content
 
     def reset(self) -> None:
         self._history.clear()

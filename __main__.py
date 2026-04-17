@@ -25,41 +25,58 @@ CLR_LINE = "\033[2K"
 
 _CLI_CONFIG_PATH = Path.home() / ".aevum" / "cli_config.json"
 
+_CODE_WIDTH = 52
+
+
+def _render_code_block(code_lines: list[str], lang: str) -> list[str]:
+    out = []
+    label = f" {lang} " if lang else ""
+    top   = f"─{label}" + "─" * (_CODE_WIDTH - len(label))
+    out.append(f"  {GY}╭{top}╮{R}")
+    for ln in code_lines:
+        # strip trailing whitespace, leave leading indent intact
+        content = ln.rstrip()
+        out.append(f"  {GY}│{R}  {CY}{content}{R}")
+    out.append(f"  {GY}╰{'─' * (_CODE_WIDTH + 1)}╯{R}")
+    return out
+
+
 def _render_md(text: str) -> str:
     import re
-    lines  = text.split("\n")
-    out    = []
-    in_code = False
+    lines    = text.split("\n")
+    out: list[str] = []
+    in_code  = False
+    code_buf: list[str] = []
+    code_lang = ""
     i = 0
     while i < len(lines):
         line = lines[i]
 
-        # fenced code block toggle
         if line.strip().startswith("```"):
             if not in_code:
-                in_code = True
-                lang = line.strip()[3:].strip()
-                if lang:
-                    out.append(f"  {DIM}{GY}{lang}{R}")
+                in_code   = True
+                code_lang = line.strip()[3:].strip()
+                code_buf  = []
             else:
-                in_code = False
+                out.extend(_render_code_block(code_buf, code_lang))
                 out.append("")
+                in_code = False
+                code_buf = []
             i += 1
             continue
 
         if in_code:
-            out.append(f"  {CY}{line}{R}")
+            code_buf.append(line)
             i += 1
             continue
 
-        # horizontal rule
         stripped = line.strip()
+
         if re.fullmatch(r"[-*_]{3,}", stripped):
             out.append(f"  {GY}{'─' * 46}{R}")
             i += 1
             continue
 
-        # headers
         m = re.match(r"^(#{1,3})\s+(.*)", line)
         if m:
             level = len(m.group(1))
@@ -74,40 +91,45 @@ def _render_md(text: str) -> str:
             i += 1
             continue
 
-        # bullets
         m = re.match(r"^(\s*)[-*]\s+(.*)", line)
         if m:
-            indent = len(m.group(1))
-            content = m.group(2)
-            content = _inline_md(content)
-            pad = "  " * (indent // 2 + 1)
-            out.append(f"{pad}{GY}•{R}  {content}")
+            indent  = len(m.group(1))
+            content = _inline_md(m.group(2))
+            pad     = "  " * (indent // 2 + 1)
+            out.append(f"{pad}{GY}·{R}  {content}")
             i += 1
             continue
 
-        # numbered list
         m = re.match(r"^(\s*)(\d+)\.\s+(.*)", line)
         if m:
             indent  = len(m.group(1))
             num     = m.group(2)
-            content = m.group(3)
-            content = _inline_md(content)
-            pad = "  " * (indent // 2 + 1)
+            content = _inline_md(m.group(3))
+            pad     = "  " * (indent // 2 + 1)
             out.append(f"{pad}{GY}{num}.{R}  {content}")
             i += 1
             continue
 
-        # blank line
         if not stripped:
             out.append("")
             i += 1
             continue
 
-        # normal paragraph line
         out.append(f"  {_inline_md(line)}")
         i += 1
 
+    # unclosed code block fallback
+    if in_code and code_buf:
+        out.extend(_render_code_block(code_buf, code_lang))
+
     return "\n".join(out)
+
+
+def _print_response(rendered: str, delay: float = 0.012) -> None:
+    """Print rendered markdown line-by-line with a subtle fade-in."""
+    for line in rendered.split("\n"):
+        print(line)
+        time.sleep(delay)
 
 
 def _inline_md(text: str) -> str:
@@ -135,8 +157,7 @@ _SPIN_WORDS = [
     "weaving", "conjuring", "reflecting", "crafting",
     "computing", "simmering", "focusing", "processing",
 ]
-_SPIN_CHARS = itertools.cycle(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
-
+_SPIN_CHARS     = itertools.cycle(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
 _FRAMES_PER_WORD = 12
 
 
@@ -146,9 +167,9 @@ class _Spinner:
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
-        words   = itertools.cycle(_SPIN_WORDS)
-        word    = next(words)
-        frame   = 0
+        words = itertools.cycle(_SPIN_WORDS)
+        word  = next(words)
+        frame = 0
         while not self._stop.is_set():
             char = next(_SPIN_CHARS)
             print(f"\r  {DIM}{char}{R} {GY}aevum {word}...{R}", end="", flush=True)
@@ -349,8 +370,7 @@ async def _chat_loop(
         old_echo        = _echo_off()
         spinner_stopped = False
 
-        _STEP_ICONS  = {"thought": "◈", "action": "⟳", "observation": "◎"}
-        _STEP_COLORS = {"thought": GY,  "action": CY,  "observation": GR}
+        _STEP_COLORS = {"thought": GY, "action": CY, "observation": GR}
 
         def on_step(step_type: str, content: str) -> None:
             nonlocal spinner_stopped
@@ -358,10 +378,8 @@ async def _chat_loop(
                 spinner.stop()
                 _echo_on(old_echo)
                 spinner_stopped = True
-            icon  = _STEP_ICONS.get(step_type, "·")
-            col   = _STEP_COLORS.get(step_type, GY)
-            label = f"{step_type:<11}"
-            print(f"  {col}{DIM}{icon} {label}{R} {GY}{content}{R}")
+            col = _STEP_COLORS.get(step_type, GY)
+            print(f"  {col}{DIM}{content[:80]}{R}")
 
         spinner.start()
         try:
@@ -372,14 +390,12 @@ async def _chat_loop(
                 spinner.stop()
                 _echo_on(old_echo)
             if full_response:
-                print(f"\n  {color}aevum{R}  {GY}›{R}")
-                print(_render_md(full_response))
+                print(f"\n  {color}aevum{R}  {GY}›{R}\n")
+                _print_response(_render_md(full_response))
             meta = agent.last_meta
-            if meta:
-                src_color = GR if meta.source == "mine" else GY
-                xfer      = f"  {DIM}transfer → {meta.transfer}{R}" if not meta.transfer.startswith("no") else ""
-                print(f"\n  {src_color}{DIM}source: {meta.source}  ·  {meta.reason}{R}{xfer}")
-            print(f"  {GY}{'╌' * 46}{R}\n")
+            if meta and meta.source == "mine":
+                print(f"\n  {GR}{DIM}{meta.reason}{R}")
+            print(f"\n  {GY}{'╌' * 46}{R}\n")
         except Exception as exc:
             if not spinner_stopped:
                 spinner.stop()
