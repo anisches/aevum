@@ -344,21 +344,36 @@ async def _chat_loop(
     agent = _make_agent(provider_name, model)
     color = PROVIDER_COLORS.get(provider_name, CY)
 
+    async def _close(reason: str = "goodbye") -> None:
+        print(f"\n  {DIM}reflecting on session...{R}", end="", flush=True)
+        try:
+            await agent.end_session()
+            print(f"\r{CLR_LINE}  {GY}session saved.{R}")
+        except Exception:
+            print(f"\r{CLR_LINE}")
+        print(f"\n  {DIM}{reason}.{R}\n")
+
     while True:
         try:
             user_input = input(f"  {CY}you{R}  {GY}›{R}  ").strip()
         except (EOFError, KeyboardInterrupt):
-            print(f"\n\n  {DIM}goodbye.{R}\n")
+            await _close()
             break
 
         if not user_input:
             continue
 
         if user_input.lower() in {"exit", "quit", "q"}:
-            print(f"\n  {DIM}goodbye.{R}\n")
+            await _close()
             break
 
         if user_input.lower() == "/model":
+            print(f"\n  {DIM}reflecting on session...{R}", end="", flush=True)
+            try:
+                await agent.end_session()
+                print(f"\r{CLR_LINE}")
+            except Exception:
+                print(f"\r{CLR_LINE}")
             provider_name, model = _configure(ollama_url)
             color = PROVIDER_COLORS.get(provider_name, CY)
             agent = _make_agent(provider_name, model)

@@ -17,7 +17,7 @@ from tools.read_write import ReadFileTool, WriteFileTool
 from tools.web_search import WebSearchTool
 
 from .config import Config
-from .state import AgentState, Skill
+from .state import AgentState, Breadcrumb, Episode, Skill
 
 _DEFAULT_STATE_PATH = Path.home() / ".aevum" / "state.json"
 
@@ -99,6 +99,47 @@ For each that applied and worked, reply:
 applied: <exact skill name>
 
 If none applied or worked, reply with exactly: none"""
+
+_GAPS_PROMPT = """\
+Session reflection:
+trigger: {trigger}
+trajectory: {trajectory}
+outcome: {outcome}
+reflection: {reflection}
+
+What 1-2 specific topics should you search to be better prepared for similar tasks?
+Focus on: knowledge gaps, things you had to guess, concepts that came up but weren't mastered.
+
+Reply in this exact format (repeat block for each topic):
+topic: <specific search query>
+reason: <one sentence — why this matters>
+
+If nothing worth searching, reply: none"""
+
+_DISTILL_PROMPT = """\
+Topic: {topic}
+Reason to learn: {reason}
+Search results:
+{results}
+
+Distill this into a reusable knowledge nugget — something that will help in future sessions.
+Be specific, factual, and concise.
+
+Reply in this exact format:
+summary: <2-3 sentences of distilled knowledge>
+tags: <3-5 comma-separated keywords>"""
+
+_REFLECT_PROMPT = """\
+Session turns:
+{turns}
+
+Reflect on this session from first person. Be honest and direct.
+
+Reply in this exact format:
+trigger: <the core ask or project in one sentence>
+trajectory: <2-3 sentences: what was attempted, what tools/steps were used, any pivots>
+outcome: completed | stuck | partial
+reflection: <one honest sentence: what happened, what you'd do differently, or what worked>"""
 
 _VALIDATE_PROMPT = """\
 Exchange:
@@ -282,6 +323,7 @@ class Agent:
         self._state_path = state_path or _DEFAULT_STATE_PATH
         self._state = AgentState.load(self._state_path)
         self.last_meta: ResponseMeta | None = None
+        self._session_turns: list[dict] = []
 
         self.register_tool(ReadFileTool())
         self.register_tool(WriteFileTool())
@@ -324,7 +366,7 @@ class Agent:
         return "\n".join(lines)
 
     def _build_messages(self, user_input: str, pre_context: str = "") -> list[Message]:
-        system = self._state.build_system_prompt()
+        system = self._state.build_system_prompt(user_input)
         if pre_context:
             system += f"\n\npre-response context:\n{pre_context}"
         return [
@@ -344,7 +386,7 @@ class Agent:
         self,
         user_input: str,
         on_step: Callable[[str, str], None] | None = None,
-    ) -> tuple[str, list[str]]:
+    ) -> tuple[str, list[str], str, str]:
         classify_raw = await self._llm(
             _CLASSIFY_PROMPT.format(user_input=user_input), max_tokens=150
         )
@@ -437,7 +479,7 @@ class Agent:
             pre_context + f"\n\nresearch gathered:\n{obs_summary}",
         )
         response = await self.provider.complete(messages, self._options())
-        return response.content, trace
+        return response.content, trace, type_, intent
 
     async def _validate_response(self, user_input: str, response: str) -> ResponseMeta:
         if not self._state.skills.skills:
@@ -512,9 +554,21 @@ class Agent:
     async def _full_pipeline(
         self, user_input: str, on_step: Callable[[str, str], None] | None = None
     ) -> tuple[CompletionResponse, ResponseMeta, list[str]]:
-        content, trace = await self._tao_loop(user_input, on_step=on_step)
+        content, trace, type_, intent = await self._tao_loop(user_input, on_step=on_step)
         response = CompletionResponse(content=content, model=self.config.model)
         meta = await self._validate_response(user_input, content)
+        outcome = (
+            "stuck" if any(t.startswith("think: stuck") for t in trace)
+            else "completed" if any(t == "think: done" for t in trace)
+            else "partial"
+        )
+        self._session_turns.append({
+            "user_input": user_input,
+            "intent": intent,
+            "type": type_,
+            "trace": trace,
+            "outcome": outcome,
+        })
         return response, meta, trace
 
     async def chat(self, user_input: str) -> CompletionResponse:
@@ -537,5 +591,115 @@ class Agent:
         await self._post_exchange(user_input, response.content, trace)
         yield response.content
 
+    async def _learn_from_episode(self, episode: Episode) -> list[Breadcrumb]:
+        raw = await self._llm(
+            _GAPS_PROMPT.format(
+                trigger=episode.trigger,
+                trajectory=episode.trajectory,
+                outcome=episode.outcome,
+                reflection=episode.reflection,
+            ),
+            max_tokens=150,
+        )
+        if raw.strip().lower().startswith("none"):
+            return []
+
+        gaps: list[tuple[str, str]] = []
+        topic = reason = ""
+        for line in raw.splitlines():
+            l = line.lower().strip()
+            if l.startswith("topic:"):
+                if topic:
+                    gaps.append((topic, reason or "no reason given"))
+                topic = line.split(":", 1)[1].strip()
+                reason = ""
+            elif l.startswith("reason:"):
+                reason = line.split(":", 1)[1].strip()
+        if topic:
+            gaps.append((topic, reason or "no reason given"))
+
+        breadcrumbs: list[Breadcrumb] = []
+        web_tool = self.tools.get("web_search")
+        for topic, reason in gaps[:2]:
+            if web_tool:
+                result = await web_tool.run(query=topic)
+                raw_results = str(result.output) if not result.error else ""
+            else:
+                raw_results = "no search tool available"
+
+            distilled = await self._llm(
+                _DISTILL_PROMPT.format(
+                    topic=topic,
+                    reason=reason,
+                    results=raw_results[:1500],
+                ),
+                max_tokens=150,
+            )
+
+            summary = tags_raw = ""
+            for line in distilled.splitlines():
+                l = line.lower().strip()
+                if l.startswith("summary:"):
+                    summary = line.split(":", 1)[1].strip()
+                elif l.startswith("tags:"):
+                    tags_raw = line.split(":", 1)[1].strip()
+
+            if summary:
+                crumb = Breadcrumb(
+                    timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    topic=topic,
+                    summary=summary,
+                    tags=[t.strip() for t in tags_raw.split(",") if t.strip()],
+                )
+                self._state.knowledge.record(crumb)
+                breadcrumbs.append(crumb)
+
+        return breadcrumbs
+
+    async def end_session(self) -> Episode | None:
+        if not self._session_turns:
+            return None
+
+        turns_text = "\n\n".join(
+            f"turn {i+1}:\n"
+            f"  user: {t['user_input'][:120]}\n"
+            f"  intent: {t['intent'][:100]}\n"
+            f"  trace: {'; '.join(t['trace'][:5])}\n"
+            f"  outcome: {t['outcome']}"
+            for i, t in enumerate(self._session_turns[-8:])
+        )
+
+        raw = await self._llm(_REFLECT_PROMPT.format(turns=turns_text), max_tokens=400)
+
+        trigger = trajectory = reflection = ""
+        outcome = "partial"
+        for line in raw.splitlines():
+            l = line.lower().strip()
+            if l.startswith("trigger:"):
+                trigger = line.split(":", 1)[1].strip()
+            elif l.startswith("trajectory:"):
+                trajectory = line.split(":", 1)[1].strip()
+            elif l.startswith("outcome:"):
+                val = line.split(":", 1)[1].strip().lower()
+                if val in ("completed", "stuck", "partial"):
+                    outcome = val
+            elif l.startswith("reflection:"):
+                reflection = line.split(":", 1)[1].strip()
+
+        episode = Episode(
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"),
+            trigger=trigger or self._session_turns[0]["user_input"][:80],
+            trajectory=trajectory or "no trajectory captured",
+            outcome=outcome,
+            reflection=reflection or "no reflection generated",
+        )
+        self._state.episodes.record(episode)
+        await self._learn_from_episode(episode)
+        self._state.save(self._state_path)
+        self._session_turns.clear()
+        self._history.clear()
+        return episode
+
     def reset(self) -> None:
         self._history.clear()
+        self._session_turns.clear()
