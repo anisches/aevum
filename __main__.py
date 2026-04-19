@@ -344,36 +344,24 @@ async def _chat_loop(
     agent = _make_agent(provider_name, model)
     color = PROVIDER_COLORS.get(provider_name, CY)
 
-    async def _close(reason: str = "goodbye") -> None:
-        print(f"\n  {DIM}reflecting on session...{R}", end="", flush=True)
-        try:
-            await agent.end_session()
-            print(f"\r{CLR_LINE}  {GY}session saved.{R}")
-        except Exception:
-            print(f"\r{CLR_LINE}")
+    def _close(reason: str = "goodbye") -> None:
         print(f"\n  {DIM}{reason}.{R}\n")
 
     while True:
         try:
             user_input = input(f"  {CY}you{R}  {GY}›{R}  ").strip()
         except (EOFError, KeyboardInterrupt):
-            await _close()
+            _close()
             break
 
         if not user_input:
             continue
 
         if user_input.lower() in {"exit", "quit", "q"}:
-            await _close()
+            _close()
             break
 
         if user_input.lower() == "/model":
-            print(f"\n  {DIM}reflecting on session...{R}", end="", flush=True)
-            try:
-                await agent.end_session()
-                print(f"\r{CLR_LINE}")
-            except Exception:
-                print(f"\r{CLR_LINE}")
             provider_name, model = _configure(ollama_url)
             color = PROVIDER_COLORS.get(provider_name, CY)
             agent = _make_agent(provider_name, model)
@@ -407,9 +395,6 @@ async def _chat_loop(
             if full_response:
                 print(f"\n  {color}aevum{R}  {GY}›{R}\n")
                 _print_response(_render_md(full_response))
-            meta = agent.last_meta
-            if meta and meta.source == "mine":
-                print(f"\n  {GR}{DIM}{meta.reason}{R}")
             print(f"\n  {GY}{'╌' * 46}{R}\n")
         except Exception as exc:
             if not spinner_stopped:
